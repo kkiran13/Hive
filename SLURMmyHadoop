@@ -1,0 +1,160 @@
+#!/bin/bash
+#SBATCH --partition=debug
+#SBATCH --time=00:20:00
+#SBATCH --nodes=2
+#SBATCH --ntasks-per-node=2
+#SBATCH --exclusive
+#SBATCH --job-name="Stock_hive"
+#SBATCH --output=test-%J.out
+#SBATCH --mail-user=kkiran@buffalo.edu
+#Specifies that the job will be requeued after a node failure.
+#The default is that the job will not be requeued.
+#
+#This SLURM script is modified version of the SDSC script
+# found in /util/academic/myhadoop/myHadoop-0.30b/examples.
+# CDC January 29, 2015
+#
+sta=$(date +"%T")
+echo "Start time : $sta"
+echo "SLURM_JOBID="$SLURM_JOBID
+echo "SLURM_JOB_NODELIST"=$SLURM_JOB_NODELIST
+echo "SLURM_NNODES"=$SLURM_NNODES
+echo "SLURMTMPDIR="$SLURMTMPDIR
+
+echo "working directory = "$SLURM_SUBMIT_DIR
+
+module load java/1.6.0_22
+module load hadoop/2.5.1
+module load hive/0.14.0
+module load myhadoop/0.30b
+module list
+echo "MH_HOME="$MH_HOME
+echo "HADOOP_HOME="$HADOOP_HOME
+echo "Setting HADOOP to use SLURMTMPDIR on the local disk"
+export MH_SCRATCH_DIR=$SLURMTMPDIR
+echo "MH_SCRATCH_DIR="$MH_SCRATCH_DIR
+#### Set this to the directory where Hadoop configs should be generated
+# Don't change the name of this variable (HADOOP_CONF_DIR) as it is
+# required by Hadoop - all config files will be picked up from here
+#
+# Make sure that this is accessible to all nodes
+export HADOOP_CONF_DIR=$SLURM_SUBMIT_DIR/config-$SLURM_JOBID
+export HIVE_CONF_DIR=$SLURM_SUBMIT_DIR/config-$SLURM_JOBID
+echo "create diretory for HIVE metadata"
+### Set up the configuration
+# Make sure number of nodes is the same as what you have requested from PBS
+# usage: $myhadoop-configure.sh -h
+# this is the non-persistent mode
+NPROCS=`srun --nodes=${SLURM_NNODES} bash -c 'hostname' |wc -l`
+echo "-------Set up the configurations for myHadoop"
+$MH_HOME/bin/myhadoop-configure.sh 
+#
+cp $HIVE_HOME/conf/hive-env.sh-sample $HIVE_CONF_DIR/hive-env.sh
+cp $HIVE_HOME/conf/hive-default.xml-sample $HIVE_CONF_DIR/hive-default.xml
+sed -i 's:MY_HIVE_SCRATCH:'"$SLURMTMPDIR"':g' $HIVE_CONF_DIR/hive-default.xml
+cp $HIVE_HOME/conf/hive-log4j.properties-sample $HIVE_CONF_DIR/hive-log4j.properties
+sed -i 's:MY_HIVE_DIR:'"$SLURM_SUBMIT_DIR"':' $HIVE_CONF_DIR/hive-log4j.properties
+ls -l $HADOOP_CONF_DIR
+echo "-------Start hdfs and yarn ---"
+$HADOOP_HOME/sbin/start-all.sh
+#### Format HDFS, if this is the first time or not a persistent instance
+echo "-------Show Report ---"
+#$HADOOP_HOME/bin/hadoop dfsadmin -report
+echo "-------make directory ---"
+# DON'T CHANGE THSES COMMAND, AS YOU WILL NEED THESE DIRECTORY FOR CREATING TABLE
+$HADOOP_HOME/bin/hdfs --config $HADOOP_CONF_DIR dfs -mkdir /tmp
+$HADOOP_HOME/bin/hdfs --config $HADOOP_CONF_DIR dfs -mkdir -p /user/hive/warehouse
+$HADOOP_HOME/bin/hdfs --config $HADOOP_CONF_DIR dfs -chmod g+w /tmp
+$HADOOP_HOME/bin/hdfs --config $HADOOP_CONF_DIR dfs -chmod g+w /user/hive/warehouse
+#echo "-------list warehouse directory ---"
+$HADOOP_HOME/bin/hdfs --config $HADOOP_CONF_DIR dfs -ls /user/hive/warehouse
+
+echo "Create database stocks"
+$HIVE_HOME/bin/hive -e "DROP TABLE IF EXISTS stock"
+
+$HIVE_HOME/bin/hive -e "CREATE TABLE stock (
+  DAT string,OPEN string,HIGH string,LOW string,CLOSE string,VOLUME string,ADJCLOSE string
+) row format delimited fields terminated by ',' stored as textfile;"
+
+echo "Load data"
+$HIVE_HOME/bin/hive -e "LOAD DATA LOCAL INPATH '$1/*.csv' OVERWRITE INTO TABLE stock;"
+
+echo "Create database stockin"
+$HIVE_HOME/bin/hive -e "DROP TABLE IF EXISTS stockin"
+$HIVE_HOME/bin/hive -e "CREATE TABLE stockin row format delimited fields terminated by '\t' stored as textfile as select INPUT__FILE__NAME a,DAT b,ADJCLOSE c from stock;"
+
+$HIVE_HOME/bin/hive -e "DROP TABLE IF EXISTS stock"
+
+echo "Create database reqdata"
+$HIVE_HOME/bin/hive -e "DROP TABLE IF EXISTS stockreqfd"
+$HIVE_HOME/bin/hive -e "CREATE TABLE stockreqfd row format delimited fields terminated by '\t' stored as textfile as select concat(a,'+',substr(b,0,7)) kkey, concat(substr(b,9,10),c) vval from stockin SORT BY vval ASC;"
+
+$HIVE_HOME/bin/hive -e "DROP TABLE IF EXISTS stockin"
+
+echo "Create database mindata"
+$HIVE_HOME/bin/hive -e "DROP TABLE IF EXISTS mindata"
+$HIVE_HOME/bin/hive -e "CREATE TABLE mindata row format delimited fields terminated by '\t' stored as textfile as select kkey,vval from 
+(select kkey,vval,row_number() over (partition by kkey order by vval ASC) r from stockreqfd) z 
+where r = 1;"	
+
+echo "Create database maxdata"
+$HIVE_HOME/bin/hive -e "DROP TABLE IF EXISTS maxdata"
+$HIVE_HOME/bin/hive -e "CREATE TABLE maxdata row format delimited fields terminated by '\t' stored as textfile as select kkey,vval from 
+(select kkey,vval,row_number() over (partition by kkey order by vval DESC) r from stockreqfd) z 
+where r = 1;"
+
+$HIVE_HOME/bin/hive -e "DROP TABLE IF EXISTS stockreqfd"
+
+echo "Join min and max"
+$HIVE_HOME/bin/hive -e "DROP TABLE IF EXISTS joindata"
+$HIVE_HOME/bin/hive -e "CREATE TABLE joindata row format delimited fields terminated by '\t' stored as textfile as select substr(mi.kkey,1,length(mi.kkey)-8) kkey,substr(ma.vval,3,length(ma.vval)) maval,substr(mi.vval,3,length(mi.vval)) mival, ((substr(ma.vval,3,length(ma.vval))-substr(mi.vval,3,length(mi.vval)))/substr(mi.vval,3,length(mi.vval))) xi from mindata mi,maxdata ma where mi.kkey=ma.kkey;"
+
+$HIVE_HOME/bin/hive -e "DROP TABLE IF EXISTS mindata"
+$HIVE_HOME/bin/hive -e "DROP TABLE IF EXISTS maxdata"
+
+echo "xbar value"
+$HIVE_HOME/bin/hive -e "DROP TABLE IF EXISTS xbardata"
+$HIVE_HOME/bin/hive -e "CREATE TABLE xbardata row format delimited fields terminated by '\t' stored as textfile as select kkey,AVG(xi) xbar from joindata group by kkey;"
+
+echo "fdata value"
+$HIVE_HOME/bin/hive -e "DROP TABLE IF EXISTS fdata"
+$HIVE_HOME/bin/hive -e "CREATE TABLE fdata row format delimited fields terminated by '\t' stored as textfile as select jd.kkey,jd.xi-xbd.xbar,(jd.xi-xbd.xbar)*(jd.xi-xbd.xbar) sq from joindata jd,xbardata xbd where jd.kkey=xbd.kkey;"
+#$HIVE_HOME/bin/hive -e "select * from fdata;"
+
+$HIVE_HOME/bin/hive -e "DROP TABLE IF EXISTS joindata"
+$HIVE_HOME/bin/hive -e "DROP TABLE IF EXISTS xbardata"
+
+echo "volat_t value"
+$HIVE_HOME/bin/hive -e "DROP TABLE IF EXISTS volat_t"
+$HIVE_HOME/bin/hive -e "CREATE TABLE volat_t row format delimited fields terminated by '\t' stored as textfile as select kkey stock,SQRT(SUM(sq)/(count(kkey)-1)) volatility from fdata group by kkey;"
+echo "******Minimum Ten Stocks************"
+$HIVE_HOME/bin/hive -e "select * from volat_t where volatility is not NULL and volatility!=0 order by volatility asc limit 10;"
+echo "*************************************"
+echo "******Maximum Ten Stocks************"
+$HIVE_HOME/bin/hive -e "select * from volat_t order by volatility desc limit 10;"
+echo "*************************************"
+
+end1=$(date +"%T")
+echo "Hive end time : $end1"
+#echo "show database"
+#$HIVE_HOME/bin/hive -e "SHOW DATABASES;"
+
+#echo " add file splitter in hive prompt"
+#$HIVE_HOME/bin/hive -e "add FILE splitter.py;"
+
+#echo " run python script"
+#$HIVE_HOME/bin/hive -e "
+#INSERT OVERWRITE TABLE words 
+#  SELECT TRANSFORM(text) 
+#    USING 'python splitter.py' 
+#    AS word
+#FROM doc;"
+
+echo "-------Stop hdfs and yarn ---"
+$HADOOP_HOME/sbin/stop-all.sh
+end2=$(date +"%T")
+echo "Before clean time : $end2"
+#### Clean up the working directories after job completion
+$MH_HOME/bin/myhadoop-cleanup.sh
+end3=$(date +"%T")
+echo "After clean time : $end3"
